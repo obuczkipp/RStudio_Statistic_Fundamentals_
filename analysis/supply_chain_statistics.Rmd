@@ -1,0 +1,1133 @@
+---
+title: "Statistical Fundamentals in R: Supply Chain Analysis"
+output:
+  github_document:
+    toc: true
+    toc_depth: 2
+    html_preview: false
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.path = "figures/", dpi = 110, fig.width = 9, fig.height = 5,
+  fig.align = "center", comment = "#>"
+)
+options(width = 110, scipen = 6, digits = 4)
+set.seed(2024)
+```
+
+This notebook walks through the core toolkit of applied statistics on one
+dataset: descriptive statistics, distributions, confidence intervals,
+hypothesis tests, effect sizes, correlation, regression, resampling, power
+analysis, and multiple-testing correction.
+
+Every section follows the same structure:
+
+* **What it measures.** The idea behind the method.
+* **When to use it.** Its assumptions, and the alternative to use when they fail.
+* **Result.** What the numbers say about this dataset.
+
+The data describe 100 products (SKUs) of a fashion and beauty company: pricing,
+sales, inventory, suppliers, manufacturing, quality inspection, and logistics.
+
+```{r packages}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(scales)
+source(file.path("..", "R", "helpers.R"))
+```
+
+# 1. Data overview and quality
+
+```{r load}
+raw <- read.csv(file.path("..", "data", "supply_chain_data.csv"), check.names = FALSE)
+
+# Syntactic, snake_case column names make the code easier to read.
+sc <- raw
+names(sc) <- tolower(gsub("[^A-Za-z]+", "_", names(sc)))
+sc <- sc %>%
+  rename(lead_time_customer = lead_times,      # "Lead times": order-to-delivery
+         lead_time_supplier = lead_time) %>%   # "Lead time": supplier lead time
+  mutate(across(where(is.character) & !sku, factor))
+
+dim(sc)
+str(sc)
+```
+
+```{r quality}
+quality <- data.frame(
+  missing_values = sum(is.na(sc)),
+  duplicate_rows = sum(duplicated(sc)),
+  duplicate_skus = sum(duplicated(sc$sku))
+)
+knitr::kable(quality)
+```
+
+**Result.** The data has 100 rows and 24 columns, with no missing values, no
+duplicate rows, and one row per SKU. That gives 15 numeric and 8 categorical
+variables (plus the SKU identifier).
+
+```{r variable-groups}
+num_vars <- names(sc)[sapply(sc, is.numeric)]
+cat_vars <- setdiff(names(sc)[sapply(sc, is.factor)], "sku")
+num_vars
+cat_vars
+```
+
+# 2. Descriptive statistics: numeric variables
+
+**What it measures.** Descriptive statistics summarise a variable along three axes.
+
+* **Central tendency (where the typical value is).**
+  * *Mean*: the arithmetic average. It is sensitive to outliers.
+  * *Median*: the 50th percentile. It is robust to outliers.
+  * *10% trimmed mean*: the mean after dropping the top and bottom 10%. It sits between the mean and the median.
+  * *Geometric mean* and *harmonic mean*: for multiplicative quantities and for rates. For positive data the order is always harmonic ≤ geometric ≤ arithmetic.
+* **Dispersion (how spread out the values are).**
+  * *Variance* and *standard deviation (SD)*: the average squared distance from the mean, and its square root.
+  * *Range*: maximum minus minimum.
+  * *IQR*: Q3 − Q1, the range of the middle 50%.
+  * *MAD*: the median absolute deviation, a robust version of the SD.
+  * *Coefficient of variation (CV)*: SD / mean. It is unit-free, so it can compare a price and a lead time.
+* **Uncertainty of the mean.**
+  * *Standard error (SE)*: SD / √n.
+  * *95% confidence interval*: mean ± t(0.975, n−1) · SE. It is the range of population means compatible with the sample.
+* **Shape.**
+  * *Skewness*: 0 = symmetric, > 0 = long right tail.
+  * *Excess kurtosis*: 0 = normal. Below 0 means flatter with thin tails (platykurtic); above 0 means peaked with heavy tails.
+
+```{r descriptives}
+desc <- do.call(rbind, lapply(sc[num_vars], describe_numeric))
+desc_view <- round_df(desc[, c("mean", "trim_mean", "median", "sd", "se_mean", "ci95_low",
+                               "ci95_high", "cv", "min", "q1", "q3", "max", "iqr", "mad",
+                               "skewness", "kurtosis")], 2)
+knitr::kable(desc_view)
+```
+
+```{r means-comparison}
+knitr::kable(round_df(desc[, c("mean", "geo_mean", "harm_mean", "variance", "range",
+                               "p05", "p95")], 2))
+```
+
+```{r cv-plot, fig.height = 4.5}
+desc %>%
+  mutate(variable = reorder(rownames(desc), cv)) %>%
+  ggplot(aes(cv, variable)) +
+  geom_col(fill = PALETTE[1]) +
+  geom_text(aes(label = percent(cv, 1)), hjust = -0.15, size = 3.2) +
+  scale_x_continuous(labels = percent, expand = expansion(mult = c(0, .12))) +
+  labs(title = "Relative variability (coefficient of variation)",
+       subtitle = "SD as a share of the mean: comparable across units", x = "CV", y = NULL) +
+  theme_stats()
+```
+
+**Result.**
+
+* For almost every variable the mean and the median are close and the skewness is near 0, so the distributions are symmetric.
+* Excess kurtosis lies between −1.1 and −1.4 for every variable, close to −1.2, the value of a **uniform distribution**. Values are spread evenly between the minimum and the maximum, with no central peak. This pattern is typical of simulated data, and we keep it in mind when interpreting the tests below.
+* Defect rates (`defect_rates`) average `r round(desc["defect_rates", "mean"], 2)`% (95% CI `r round(desc["defect_rates", "ci95_low"], 2)`% to `r round(desc["defect_rates", "ci95_high"], 2)`%).
+* Number of products sold has the largest relative variability (CV `r percent(desc["number_of_products_sold", "cv"], 1)`).
+
+## Outliers
+
+There are three detection rules. The z-score rule assumes normality. Tukey's fences
+and the modified z-score use quartiles and medians, so they are robust to the
+outliers they are trying to find.
+
+```{r outliers}
+out_tab <- t(sapply(sc[num_vars], outlier_counts))
+knitr::kable(out_tab)
+```
+
+```{r boxplots, fig.height = 6}
+sc %>%
+  select(all_of(num_vars)) %>%
+  mutate(across(everything(), ~ as.numeric(scale(.x)))) %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(value, reorder(name, value, FUN = IQR))) +
+  geom_boxplot(fill = PALETTE[1], alpha = .25, outlier.colour = PALETTE[2]) +
+  labs(title = "Standardised distributions (z-scores)",
+       subtitle = "Box = IQR, whiskers = 1.5 x IQR (Tukey fences)", x = "z-score", y = NULL) +
+  theme_stats()
+```
+
+**Result.** None of the rules finds an outlier in any variable. Uniform-like data
+has short tails, so this is expected.
+
+## Concentration: Pareto and Lorenz curve
+
+In supply chains, a few products often generate most of the revenue (the "80/20
+rule"). The **Lorenz curve** plots the cumulative share of revenue against the
+cumulative share of products. The **Gini coefficient** is twice the area between
+the curve and the equality line: 0 means every product earns the same, 1 means one
+product earns everything.
+
+```{r lorenz, fig.height = 4.5}
+rev_sorted <- sort(sc$revenue_generated, decreasing = TRUE)
+top20_share <- sum(rev_sorted[1:20]) / sum(rev_sorted)
+g_rev <- gini(sc$revenue_generated)
+
+lorenz <- data.frame(p = c(0, seq_along(rev_sorted) / length(rev_sorted)),
+                     L = c(0, cumsum(sort(sc$revenue_generated)) / sum(sc$revenue_generated)))
+ggplot(lorenz, aes(p, L)) +
+  geom_abline(linetype = 2, colour = "grey50") +
+  geom_area(fill = PALETTE[1], alpha = .15) +
+  geom_line(colour = PALETTE[1], linewidth = 1) +
+  scale_x_continuous(labels = percent) + scale_y_continuous(labels = percent) +
+  labs(title = sprintf("Lorenz curve of revenue (Gini = %.2f)", g_rev),
+       subtitle = "Dashed line = perfect equality",
+       x = "Cumulative share of products (lowest to highest revenue)",
+       y = "Cumulative share of revenue") +
+  coord_equal() + theme_stats()
+```
+
+**Result.** The Gini coefficient is `r round(g_rev, 2)`, and the top 20% of SKUs
+generate `r percent(top20_share, 1)` of revenue. That is far below the 80% of a
+classic Pareto pattern. Revenue is spread fairly evenly, so no small group of
+"hero products" dominates.
+
+# 3. Descriptive statistics: categorical variables
+
+**What it measures.**
+
+* **Frequencies and proportions.**
+* The **mode**: the most frequent category.
+* **95% Wilson confidence intervals** for each proportion.
+* **Normalised Shannon entropy**: 0 means all observations are in one category, 1 means they are spread perfectly evenly.
+
+```{r categorical}
+cat_summary <- do.call(rbind, lapply(cat_vars, function(v) {
+  e <- entropy(sc[[v]])
+  data.frame(variable = v, levels = nlevels(sc[[v]]), mode = stat_mode(sc[[v]]),
+             mode_share = max(prop.table(table(sc[[v]]))),
+             entropy_bits = e[["entropy_bits"]], entropy_normalised = e[["normalised"]])
+}))
+knitr::kable(round_df(cat_summary, 3))
+```
+
+```{r inspection-proportions, fig.height = 3.5}
+insp <- wilson_table(sc$inspection_results)
+knitr::kable(round_df(insp, 3))
+
+ggplot(insp, aes(proportion, reorder(level, proportion))) +
+  geom_col(fill = PALETTE[1], alpha = .8) +
+  geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), height = .25) +
+  scale_x_continuous(labels = percent) +
+  labs(title = "Quality inspection outcomes", subtitle = "Bars: share, whiskers: 95% Wilson CI",
+       x = "Share of SKUs", y = NULL) +
+  theme_stats()
+```
+
+## Goodness-of-fit and binomial tests
+
+* The **chi-square goodness-of-fit test** checks whether the observed category
+  frequencies match the expected ones. Here H0 is that all product types are
+  equally common.
+* The **exact binomial test** checks one proportion against a target value. Here H0
+  is that the inspection failure rate equals the 30% quality benchmark. It uses the
+  binomial distribution directly, with no normal approximation.
+
+```{r gof}
+gof <- chisq.test(table(sc$product_type))
+gof
+binom <- binom.test(sum(sc$inspection_results == "Fail"), nrow(sc), p = 0.30)
+binom
+```
+
+**Result.**
+
+* Product types are `r if (gof$p.value < .05) "not " else ""`equally represented (χ² = `r round(gof$statistic, 2)`, p = `r fmt_p(gof$p.value)`).
+* The failure rate is `r percent(binom$estimate, 1)` (95% CI `r percent(binom$conf.int[1], 1)` to `r percent(binom$conf.int[2], 1)`). This is not significantly different from the 30% benchmark (p = `r fmt_p(binom$p.value)`). The interval is wide because n = 100.
+
+# 4. Distributions and normality
+
+Many classical tests (t-test, ANOVA, the linear regression CIs) assume normally
+distributed data or residuals. We check this graphically and formally.
+
+| Test | H0 | Sensitive to |
+|---|---|---|
+| **Shapiro–Wilk** | data are normal | most powerful general test for n < 5000 |
+| **Anderson–Darling** | data are normal | deviations in the tails |
+| **Lilliefors (KS)** | data are normal | the largest CDF gap, with mean and SD estimated |
+| **Jarque–Bera** | skewness = 0 and excess kurtosis = 0 | the shape (third and fourth moments) |
+
+A small p-value is evidence **against** normality. Always look at the Q-Q plot too.
+With large n, the tests flag trivial deviations. With small n, they miss large ones.
+
+```{r normality}
+jarque_bera <- function(x) {
+  n <- length(x)
+  s <- e1071::skewness(x, type = 1); k <- e1071::kurtosis(x, type = 1)
+  jb <- n / 6 * (s^2 + k^2 / 4)
+  c(statistic = jb, p.value = pchisq(jb, df = 2, lower.tail = FALSE))
+}
+norm_tab <- do.call(rbind, lapply(num_vars, function(v) {
+  x <- sc[[v]]
+  data.frame(variable = v,
+             shapiro_W = unname(shapiro.test(x)$statistic), shapiro_p = shapiro.test(x)$p.value,
+             anderson_p = nortest::ad.test(x)$p.value,
+             lilliefors_p = nortest::lillie.test(x)$p.value,
+             jarque_bera_p = jarque_bera(x)[["p.value"]])
+}))
+norm_tab$normal_at_5pct <- norm_tab$shapiro_p > 0.05
+knitr::kable(round_df(norm_tab, 4))
+```
+
+```{r qq-plots, fig.height = 6}
+qq_vars <- c("price", "revenue_generated", "defect_rates", "shipping_costs",
+             "lead_time_supplier", "manufacturing_costs")
+sc %>%
+  select(all_of(qq_vars)) %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(sample = value)) +
+  stat_qq(colour = PALETTE[1], size = 1.2) +
+  stat_qq_line(colour = PALETTE[2]) +
+  facet_wrap(~ name, scales = "free_y") +
+  labs(title = "Normal Q-Q plots",
+       subtitle = "S-shaped curve = lighter tails than normal (typical of a uniform distribution)",
+       x = "Theoretical normal quantiles", y = "Sample quantiles") +
+  theme_stats()
+```
+
+```{r histograms, fig.height = 6}
+sc %>%
+  select(all_of(qq_vars)) %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(value)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 15, fill = PALETTE[1], alpha = .35) +
+  geom_density(colour = PALETTE[1], linewidth = .9) +
+  facet_wrap(~ name, scales = "free") +
+  labs(title = "Histograms with kernel density estimates", x = NULL, y = "Density") +
+  theme_stats()
+```
+
+**Result.** Only `r sum(norm_tab$normal_at_5pct)` of `r nrow(norm_tab)` variables
+pass Shapiro–Wilk at the 5% level. The Q-Q plots show a characteristic **S-shape**:
+the tails are shorter than normal, not longer. The flat histograms point the same
+way. This is a uniform-like distribution, not skewness. The practical conclusion is
+to report non-parametric tests next to the parametric ones. For mean comparisons
+with n ≥ 20 per group, the t-test is still reasonably robust (central limit theorem).
+
+## Distribution fitting
+
+`fitdistrplus` fits candidate distributions by maximum likelihood. We compare them
+with **AIC** (Akaike Information Criterion) = 2k − 2·log-likelihood. Lower is
+better: it rewards fit and penalises extra parameters.
+
+```{r fitdist}
+library(fitdistrplus)
+x <- sc$price
+fits <- list(
+  normal    = fitdist(x, "norm"),
+  lognormal = fitdist(x, "lnorm"),
+  gamma     = fitdist(x / 10, "gamma"),     # rescaled for numerical stability
+  uniform   = fitdist(x, "unif", method = "mme")
+)
+aic <- sapply(fits, function(f) {
+  ll <- if (f$distname == "unif") sum(dunif(x, f$estimate["min"], f$estimate["max"], log = TRUE))
+        else if (f$distname == "gamma") f$loglik - length(x) * log(10)  # back to original scale
+        else f$loglik
+  2 * length(f$estimate) - 2 * ll
+})
+knitr::kable(data.frame(distribution = names(aic), AIC = round(aic, 1))[order(aic), ], row.names = FALSE)
+ks_unif <- ks.test(x, "punif", min(x), max(x))
+```
+
+```{r fitdist-plot, fig.height = 4}
+ggplot(sc, aes(price)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 12, fill = "grey80", colour = "white") +
+  stat_function(aes(colour = "Normal"), fun = dnorm,
+                args = list(mean(x), sd(x)), linewidth = 1) +
+  stat_function(aes(colour = "Lognormal"), fun = dlnorm,
+                args = as.list(fits$lognormal$estimate), linewidth = 1) +
+  stat_function(aes(colour = "Uniform"), fun = dunif,
+                args = list(min(x), max(x)), linewidth = 1, n = 500) +
+  scale_colour_manual(values = PALETTE[1:3], name = NULL) +
+  labs(title = "Price: which distribution fits best?", x = "Price ($)", y = "Density") +
+  theme_stats()
+```
+
+**Result.** The uniform distribution has the lowest AIC for price. A
+Kolmogorov–Smirnov test against Uniform(`r round(min(x), 1)`, `r round(max(x), 1)`)
+gives p = `r fmt_p(ks_unif$p.value)`, so uniformity is not rejected. The data were
+most likely simulated from uniform distributions. (Strictly, the KS p-value is
+approximate here, because the bounds were estimated from the same data.)
+
+# 5. Confidence intervals and the bootstrap
+
+A 95% confidence interval is produced by a procedure that, over repeated samples,
+captures the true parameter 95% of the time. We compute the CI of the **mean defect
+rate** in four ways, and the CI of the **median**, which has no simple formula.
+
+* **t-interval**: mean ± t · SE. It assumes the sampling distribution of the mean is approximately normal.
+* **Bootstrap**: resample the 100 SKUs with replacement 10,000 times, recompute the statistic each time, and read the CI from that distribution. It makes no distributional assumption.
+  * *Percentile*: the 2.5th and 97.5th percentiles of the bootstrap estimates.
+  * *BCa (bias-corrected and accelerated)*: corrects for bias and skewness in the bootstrap distribution. It is usually the most accurate.
+  * *Basic*: reflects the percentiles around the original estimate.
+
+```{r bootstrap}
+library(boot)
+b_mean   <- boot(sc$defect_rates, function(d, i) mean(d[i]), R = 10000)
+b_median <- boot(sc$defect_rates, function(d, i) median(d[i]), R = 10000)
+ci_mean  <- boot.ci(b_mean, type = c("perc", "bca", "basic"))
+ci_med   <- boot.ci(b_median, type = c("perc", "bca"))
+tci <- t.test(sc$defect_rates)$conf.int
+
+ci_table <- data.frame(
+  statistic = c("Mean", "Mean", "Mean", "Mean", "Median", "Median"),
+  method    = c("t-interval", "Bootstrap percentile", "Bootstrap BCa", "Bootstrap basic",
+                "Bootstrap percentile", "Bootstrap BCa"),
+  estimate  = c(rep(mean(sc$defect_rates), 4), rep(median(sc$defect_rates), 2)),
+  ci_low    = c(tci[1], ci_mean$percent[4], ci_mean$bca[4], ci_mean$basic[4],
+                ci_med$percent[4], ci_med$bca[4]),
+  ci_high   = c(tci[2], ci_mean$percent[5], ci_mean$bca[5], ci_mean$basic[5],
+                ci_med$percent[5], ci_med$bca[5])
+)
+knitr::kable(round_df(ci_table, 3))
+```
+
+```{r bootstrap-plot, fig.height = 4}
+data.frame(mean = b_mean$t[, 1]) %>%
+  ggplot(aes(mean)) +
+  geom_histogram(bins = 50, fill = PALETTE[1], alpha = .5) +
+  geom_vline(xintercept = ci_mean$bca[4:5], colour = PALETTE[2], linetype = 2) +
+  geom_vline(xintercept = mean(sc$defect_rates), colour = "black") +
+  geom_vline(xintercept = 2, colour = PALETTE[5]) +
+  annotate("text", x = 2, y = Inf, label = "2% target", vjust = 1.5, hjust = 1.1,
+           colour = PALETTE[5]) +
+  labs(title = "Bootstrap distribution of the mean defect rate (10,000 resamples)",
+       subtitle = "Dashed = 95% BCa interval; solid black = sample mean",
+       x = "Mean defect rate (%)", y = "Count") +
+  theme_stats()
+```
+
+**Result.** All four methods agree to within about 0.01 percentage points. When the
+sample is moderately large and the data are symmetric, the t-interval and the
+bootstrap give the same answer. The 2% target lies just inside the lower end of
+every interval. Section 6 tests this formally.
+
+# 6. Hypothesis tests: one sample
+
+**Question:** is the average defect rate different from the 2% quality target?
+
+* **One-sample t-test.**
+  * H0: μ = 2. The test statistic is t = (x̄ − 2) / SE, with n − 1 degrees of freedom.
+  * It assumes independent observations and an approximately normal sampling distribution of the mean.
+* **Wilcoxon signed-rank test.** The non-parametric alternative. H0: the distribution is symmetric around 2 (the median is 2). It uses the ranks of |x − 2|.
+* **Effect size: Cohen's d** = (x̄ − 2) / SD. Rough guide: 0.2 is small, 0.5 medium, 0.8 large.
+
+```{r one-sample}
+t1 <- t.test(sc$defect_rates, mu = 2)
+w1 <- wilcox.test(sc$defect_rates, mu = 2, conf.int = TRUE)
+d1 <- effectsize::cohens_d(sc$defect_rates, mu = 2)
+t1
+w1
+d1
+```
+
+**Result.**
+
+* The mean defect rate is `r round(t1$estimate, 2)`%. The t-test gives t(`r t1$parameter`) = `r round(t1$statistic, 2)`, p = `r fmt_p(t1$p.value)`, and the Wilcoxon test gives p = `r fmt_p(w1$p.value)`.
+* At α = 0.05 we **cannot reject** H0. The effect is small (d = `r round(d1$Cohens_d, 2)`).
+* This is a textbook case of "not significant ≠ no effect". The point estimate is above target and the p-value is borderline. With 100 SKUs, the test has only `r percent(pwr::pwr.t.test(n = 100, d = d1$Cohens_d, type = "one.sample")$power, 1)` power to detect an effect of this size (see Section 12).
+
+# 7. Hypothesis tests: two groups
+
+**Question:** do products that **failed** inspection have higher defect rates than
+those that **passed**?
+
+| Test | Compares | Assumes |
+|---|---|---|
+| **F-test** | variances | normality (very sensitive to it) |
+| **Levene / Brown–Forsythe** | variances | robust: works on deviations from the median |
+| **Student's t-test** | means | normality and equal variances |
+| **Welch's t-test** | means | normality only. It adjusts the df for unequal variances, so it is the recommended default |
+| **Mann–Whitney U (Wilcoxon rank-sum)** | distributions, i.e. P(X > Y) | independent samples, no normality |
+| **Permutation test** | means | only exchangeability under H0. The p-value comes from shuffling the group labels |
+
+Effect sizes:
+
+* **Cohen's d** (pooled SD), and **Hedges' g**, which is d with a small-sample bias correction.
+* **Rank-biserial correlation**, which goes with Mann–Whitney. It runs from −1 to 1.
+
+```{r two-sample-data}
+fp <- sc %>% filter(inspection_results %in% c("Fail", "Pass")) %>% droplevels()
+fp %>% group_by(inspection_results) %>%
+  summarise(n = n(), mean = mean(defect_rates), median = median(defect_rates),
+            sd = sd(defect_rates)) %>%
+  knitr::kable(digits = 3)
+```
+
+```{r two-sample-tests}
+f_var   <- var.test(defect_rates ~ inspection_results, data = fp)
+lev     <- car::leveneTest(defect_rates ~ inspection_results, data = fp, center = median)
+t_stud  <- t.test(defect_rates ~ inspection_results, data = fp, var.equal = TRUE)
+t_welch <- t.test(defect_rates ~ inspection_results, data = fp)
+mw      <- wilcox.test(defect_rates ~ inspection_results, data = fp, conf.int = TRUE)
+perm    <- coin::oneway_test(defect_rates ~ inspection_results, data = fp,
+                             distribution = coin::approximate(nresample = 10000))
+d2      <- effectsize::cohens_d(defect_rates ~ inspection_results, data = fp)
+g2      <- effectsize::hedges_g(defect_rates ~ inspection_results, data = fp)
+rb2     <- effectsize::rank_biserial(defect_rates ~ inspection_results, data = fp)
+
+two_sample <- data.frame(
+  test = c("F-test (variances)", "Brown-Forsythe / Levene (variances)", "Student t",
+           "Welch t", "Mann-Whitney U", "Permutation (10,000 shuffles)"),
+  statistic = c(f_var$statistic, lev$`F value`[1], t_stud$statistic, t_welch$statistic,
+                mw$statistic, coin::statistic(perm)),
+  p_value = c(f_var$p.value, lev$`Pr(>F)`[1], t_stud$p.value, t_welch$p.value, mw$p.value,
+              coin::pvalue(perm))
+)
+knitr::kable(round_df(two_sample, 4), row.names = FALSE)
+
+effects <- data.frame(
+  effect_size = c("Cohen's d", "Hedges' g", "Rank-biserial r"),
+  estimate = c(d2$Cohens_d, g2$Hedges_g, rb2$r_rank_biserial),
+  ci_low = c(d2$CI_low, g2$CI_low, rb2$CI_low),
+  ci_high = c(d2$CI_high, g2$CI_high, rb2$CI_high)
+)
+knitr::kable(round_df(effects, 3))
+```
+
+```{r two-sample-plot, fig.height = 4.5}
+ggplot(fp, aes(inspection_results, defect_rates, fill = inspection_results)) +
+  geom_violin(alpha = .2, colour = NA) +
+  geom_boxplot(width = .25, alpha = .6, outlier.shape = NA) +
+  geom_jitter(width = .08, size = 1.5, alpha = .6) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 3.5, fill = "white") +
+  scale_fill_manual(values = PALETTE[c(5, 3)], guide = "none") +
+  labs(title = "Defect rate by inspection result",
+       subtitle = sprintf("Welch t-test p = %s; Hedges' g = %.2f (white diamond = mean)",
+                          fmt_p(t_welch$p.value), g2$Hedges_g),
+       x = NULL, y = "Defect rate (%)") +
+  theme_stats()
+```
+
+**Result.**
+
+* Failed products have a higher mean defect rate: `r round(t_welch$estimate[1], 2)`% vs. `r round(t_welch$estimate[2], 2)`%, a difference of `r round(diff(rev(t_welch$estimate)), 2)` percentage points (Welch 95% CI `r round(t_welch$conf.int[1], 2)` to `r round(t_welch$conf.int[2], 2)`, which includes 0).
+* The variances do not differ significantly (Levene p = `r fmt_p(lev$"Pr(>F)"[1])`, borderline), and the Student and Welch tests agree.
+* Every test gives p between `r round(min(two_sample$p_value[3:6]), 2)` and `r round(max(two_sample$p_value[3:6]), 2)`. The effect is medium-sized (g = `r round(g2$Hedges_g, 2)`) but **not statistically significant**, because the groups are small (36 and 23).
+* The 95% CI of g runs from `r round(g2$CI_low, 2)` to `r round(g2$CI_high, 2)`. The data are compatible with no effect and with a large one, so a larger sample is needed.
+
+# 8. Hypothesis tests: more than two groups (ANOVA family)
+
+**Question:** do defect rates differ between the three **shipping carriers**?
+
+* **One-way ANOVA.** It splits the total variance into a between-groups part and a within-groups part. F = MS_between / MS_within. H0: all group means are equal.
+  * Assumptions: independent observations, normal residuals, and equal variances (homoscedasticity).
+* **Welch's ANOVA.** It does not assume equal variances.
+* **Kruskal–Wallis test.** The non-parametric alternative, using ranks. H0: all groups come from the same distribution.
+* **Effect sizes.**
+  * **η²** (eta squared) = SS_between / SS_total: the share of variance explained by the groups. It is biased upward in small samples.
+  * **ω²** (omega squared): a less biased estimate of the same quantity. Rough guide: 0.01 is small, 0.06 medium, 0.14 large.
+  * **ε²** (epsilon squared, rank-based): the effect size that goes with Kruskal–Wallis.
+* **Post-hoc tests.** A significant ANOVA says *some* means differ, but not which ones. Post-hoc tests compare all pairs while controlling the family-wise error rate.
+  * **Tukey HSD**: for equal variances.
+  * **Games–Howell**: for unequal variances.
+  * **Dunn's test** with Holm correction: follows Kruskal–Wallis.
+
+```{r anova-desc}
+sc %>% group_by(shipping_carriers) %>%
+  summarise(n = n(), mean = mean(defect_rates), sd = sd(defect_rates),
+            median = median(defect_rates)) %>%
+  knitr::kable(digits = 3)
+```
+
+```{r anova}
+aov1 <- aov(defect_rates ~ shipping_carriers, data = sc)
+summary(aov1)
+
+# Assumption checks
+shapiro_resid <- shapiro.test(residuals(aov1))
+levene_1 <- car::leveneTest(defect_rates ~ shipping_carriers, data = sc)
+bartlett_1 <- bartlett.test(defect_rates ~ shipping_carriers, data = sc)
+
+welch_1 <- oneway.test(defect_rates ~ shipping_carriers, data = sc, var.equal = FALSE)
+kw_1 <- kruskal.test(defect_rates ~ shipping_carriers, data = sc)
+
+anova_tab <- data.frame(
+  check_or_test = c("Shapiro-Wilk on residuals", "Levene (equal variances)",
+                    "Bartlett (equal variances, assumes normality)", "One-way ANOVA",
+                    "Welch ANOVA", "Kruskal-Wallis"),
+  statistic = c(shapiro_resid$statistic, levene_1$`F value`[1], bartlett_1$statistic,
+                summary(aov1)[[1]]$`F value`[1], welch_1$statistic, kw_1$statistic),
+  p_value = c(shapiro_resid$p.value, levene_1$`Pr(>F)`[1], bartlett_1$p.value,
+              summary(aov1)[[1]]$`Pr(>F)`[1], welch_1$p.value, kw_1$p.value)
+)
+knitr::kable(round_df(anova_tab, 4), row.names = FALSE)
+
+eff_anova <- data.frame(
+  measure = c("eta squared", "omega squared", "epsilon squared (rank)"),
+  estimate = c(effectsize::eta_squared(aov1, partial = FALSE)$Eta2,
+               effectsize::omega_squared(aov1, partial = FALSE)$Omega2,
+               effectsize::rank_epsilon_squared(defect_rates ~ shipping_carriers, data = sc)$rank_epsilon_squared)
+)
+knitr::kable(round_df(eff_anova, 3))
+```
+
+```{r posthoc}
+tukey <- TukeyHSD(aov1)
+knitr::kable(round_df(as.data.frame(tukey$shipping_carriers), 4))
+
+gh <- rstatix::games_howell_test(sc, defect_rates ~ shipping_carriers)
+knitr::kable(gh[, c("group1", "group2", "estimate", "conf.low", "conf.high", "p.adj")], digits = 4)
+
+dunn <- rstatix::dunn_test(sc, defect_rates ~ shipping_carriers, p.adjust.method = "holm")
+knitr::kable(dunn[, c("group1", "group2", "statistic", "p", "p.adj")], digits = 4)
+```
+
+```{r anova-plot, fig.height = 4.5}
+means_ci <- sc %>% group_by(shipping_carriers) %>%
+  summarise(m = mean(defect_rates), se = std_error(defect_rates), n = n()) %>%
+  mutate(lo = m - qt(.975, n - 1) * se, hi = m + qt(.975, n - 1) * se)
+
+p_a <- ggplot(sc, aes(shipping_carriers, defect_rates)) +
+  geom_jitter(width = .12, alpha = .35, colour = PALETTE[1]) +
+  geom_pointrange(data = means_ci, aes(y = m, ymin = lo, ymax = hi),
+                  colour = PALETTE[2], size = .6, linewidth = 1) +
+  labs(title = "Defect rate by carrier", subtitle = "Orange: mean with 95% CI",
+       x = NULL, y = "Defect rate (%)") + theme_stats()
+
+p_b <- as.data.frame(tukey$shipping_carriers) %>%
+  mutate(pair = rownames(.)) %>%
+  ggplot(aes(diff, reorder(pair, diff))) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  geom_pointrange(aes(xmin = lwr, xmax = upr, colour = `p adj` < .05)) +
+  scale_colour_manual(values = c(`TRUE` = PALETTE[5], `FALSE` = "grey50"),
+                      labels = c(`TRUE` = "p < 0.05", `FALSE` = "n.s."), name = NULL) +
+  labs(title = "Tukey HSD: pairwise differences", subtitle = "95% family-wise CI",
+       x = "Difference in mean defect rate (pp)", y = NULL) + theme_stats()
+p_a + p_b
+```
+
+**Result.**
+
+* Carrier B has the lowest mean defect rate. ANOVA (F = `r round(summary(aov1)[[1]]$"F value"[1], 2)`, p = `r fmt_p(summary(aov1)[[1]]$"Pr(>F)"[1])`), Welch ANOVA (p = `r fmt_p(welch_1$p.value)`) and Kruskal–Wallis (p = `r fmt_p(kw_1$p.value)`) all reject equal means at α = 0.05.
+* The carrier explains about `r percent(eff_anova$estimate[2], 1)` of the variance (ω²), a medium-sized effect.
+* The assumptions hold, if only just for normality: residual normality p = `r fmt_p(shapiro_resid$p.value)`, Levene p = `r fmt_p(levene_1$"Pr(>F)"[1])`.
+* All three post-hoc tests agree: **Carrier B differs from both Carrier A** (Tukey p = `r fmt_p(tukey$shipping_carriers["Carrier B-Carrier A", "p adj"])`) **and Carrier C** (Tukey p = `r fmt_p(tukey$shipping_carriers["Carrier C-Carrier B", "p adj"])`). A and C do not differ from each other.
+* Business reading: it is worth checking whether Carrier B's handling explains this, or whether a confounder does (for example, which products it carries). The multiple regression in Section 11 checks this.
+
+## Two-way ANOVA with interaction
+
+**Question:** do total logistics costs depend on product type, transport mode, or
+their **combination**?
+
+* An interaction means the effect of one factor depends on the level of the other.
+  On an interaction plot, non-parallel lines suggest an interaction.
+* With unbalanced cells (unequal group sizes), the order of terms matters for the
+  default (Type I) sums of squares. We therefore report **Type II** SS from
+  `car::Anova`: each main effect is tested after the other main effect.
+
+```{r two-way}
+aov2 <- aov(costs ~ product_type * transportation_modes, data = sc)
+car::Anova(aov2, type = 2)
+effectsize::omega_squared(car::Anova(aov2, type = 2), partial = TRUE)
+table(sc$product_type, sc$transportation_modes)
+```
+
+```{r interaction-plot, fig.height = 4.5}
+sc %>% group_by(transportation_modes, product_type) %>%
+  summarise(m = mean(costs), se = std_error(costs), .groups = "drop") %>%
+  ggplot(aes(transportation_modes, m, colour = product_type, group = product_type)) +
+  geom_line(linewidth = 1, position = position_dodge(.2)) +
+  geom_pointrange(aes(ymin = m - se, ymax = m + se), position = position_dodge(.2)) +
+  scale_colour_manual(values = PALETTE, name = "Product type") +
+  labs(title = "Interaction plot: mean cost by transport mode and product type",
+       subtitle = "Error bars = +/- 1 SE. Crossing lines hint at interaction, but the SEs are large",
+       x = "Transport mode", y = "Mean cost ($)") +
+  theme_stats()
+```
+
+**Result.** Neither main effect nor the interaction is significant. Some cells have
+as few as 4 products, so the SE bars are wide and the crossing lines are consistent
+with noise. With 12 cells and 100 observations, a two-way ANOVA can only detect
+large effects.
+
+# 9. Association between categorical variables
+
+**Question:** is the inspection outcome independent of the supplier?
+
+* **Pearson's chi-square test of independence.**
+  * It compares observed cell counts O with the counts expected under independence, E = row total × column total / n. χ² = Σ (O − E)² / E.
+  * It is valid when the expected counts are large enough (rule of thumb: all E ≥ 5, or at least 80% of cells ≥ 5 and none < 1).
+* **Fisher's exact test.** It computes the exact p-value from the hypergeometric distribution, so it is valid for small counts. For tables larger than 2×2, the p-value is simulated by Monte Carlo.
+* **Cramér's V** = √(χ² / (n · (min(r, c) − 1))). It measures association strength from 0 to 1.
+* **Standardised (adjusted) residuals** = (O − E) / SE. They show *which cells* drive the result. |residual| > 2 corresponds to roughly p < 0.05 for that cell.
+
+```{r chisq}
+tab_si <- table(sc$supplier_name, sc$inspection_results)
+addmargins(tab_si)
+chi <- chisq.test(tab_si)
+round(chi$expected, 1)
+mean(chi$expected >= 5)        # share of cells with expected count >= 5
+chi
+fisher <- fisher.test(tab_si, simulate.p.value = TRUE, B = 20000)
+fisher
+cv <- effectsize::cramers_v(tab_si)
+cv
+```
+
+```{r residuals-heatmap, fig.height = 4}
+as.data.frame(chi$stdres) %>%
+  setNames(c("supplier", "result", "std_residual")) %>%
+  ggplot(aes(result, supplier, fill = std_residual)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%+.1f", std_residual)), size = 3.8) +
+  geom_text(data = as.data.frame(tab_si) %>% setNames(c("supplier", "result", "n")),
+            aes(label = paste0("n=", n), fill = NULL), nudge_y = -.3, size = 2.8, colour = "grey30") +
+  scale_fill_gradient2(low = PALETTE[1], mid = "white", high = PALETTE[5], name = "Std. residual") +
+  labs(title = "Supplier x inspection result: standardised residuals",
+       subtitle = "Red = more than expected under independence; |value| > 2 is notable",
+       x = NULL, y = NULL) +
+  theme_stats()
+```
+
+```{r mosaic, fig.height = 5, fig.width = 7}
+tab_named <- tab_si
+dimnames(tab_named) <- list(Supplier = sub("Supplier ", "S", rownames(tab_si)),
+                            Inspection = colnames(tab_si))
+vcd::mosaic(tab_named, shade = TRUE, legend = TRUE,
+            main = "Mosaic plot (area = count, colour = Pearson residual)")
+```
+
+```{r two-proportions}
+# Follow-up: failure rate of Supplier 4 vs. all others (2x2 comparison)
+s4 <- sc$supplier_name == "Supplier 4"
+fails <- c(sum(sc$inspection_results[s4] == "Fail"), sum(sc$inspection_results[!s4] == "Fail"))
+ns <- c(sum(s4), sum(!s4))
+prop2 <- prop.test(fails, ns)
+prop2
+odds_s4 <- fisher.test(table(s4, sc$inspection_results == "Fail"))
+odds_s4
+```
+
+**Result.**
+
+* `r percent(mean(chi$expected >= 5), 1)` of the cells have an expected count ≥ 5 (smallest: `r round(min(chi$expected), 2)`). That is exactly at the rule-of-thumb limit, so the chi-square approximation (p = `r fmt_p(chi$p.value)`) is borderline. Fisher's exact test is the safer choice here: p = `r fmt_p(fisher$p.value)`.
+* Inspection outcome **depends on the supplier**, with a moderate association (Cramér's V = `r round(cv$Cramers_v, 2)`).
+* The residuals pinpoint two cells:
+  * **Supplier 4** has 12 failures out of 18 and *no* passes (residuals `r sprintf("%+.1f", chi$stdres["Supplier 4", "Fail"])` for Fail, `r sprintf("%+.1f", chi$stdres["Supplier 4", "Pass"])` for Pass).
+  * **Supplier 1** has many more passes than expected (`r sprintf("%+.1f", chi$stdres["Supplier 1", "Pass"])`).
+* Supplier 4's failure rate (`r percent(prop2$estimate[1], 1)`) is far above the rest (`r percent(prop2$estimate[2], 1)`), with an odds ratio of `r round(odds_s4$estimate, 1)` (Fisher p = `r fmt_p(odds_s4$p.value)`).
+* **This is the most actionable finding in the dataset: audit Supplier 4.**
+
+# 10. Correlation
+
+| Coefficient | Measures | Assumes |
+|---|---|---|
+| **Pearson r** | linear association | both variables roughly normal, no outliers |
+| **Spearman ρ** | monotonic association | the Pearson correlation of the ranks, so it is robust |
+| **Kendall τ** | monotonic association | based on concordant vs. discordant pairs. Better for small n and ties, and easier to interpret: τ = P(concordant) − P(discordant) |
+
+All three range from −1 to 1. The test of H0: ρ = 0 uses t = r√(n−2) / √(1−r²).
+**Correlation does not imply causation**, and with 105 pairs some will be
+"significant" by chance alone. That is why we apply the Benjamini–Hochberg
+correction.
+
+```{r corr-matrix, fig.height = 8, fig.width = 8}
+cor_s <- psych::corr.test(sc[num_vars], method = "spearman", adjust = "BH")
+# corr.test stores raw p-values in the lower triangle and BH-adjusted ones in the
+# upper triangle, so we build a symmetric matrix of adjusted p-values.
+p_bh_mat <- cor_s$p
+p_bh_mat[lower.tri(p_bh_mat)] <- t(p_bh_mat)[lower.tri(p_bh_mat)]
+n_sig_bh <- sum(p_bh_mat[upper.tri(p_bh_mat)] < .05)
+corrplot::corrplot(cor_s$r, method = "color", type = "lower", order = "hclust",
+                   addCoef.col = "grey20", number.cex = .55, tl.col = "black", tl.cex = .7,
+                   col = colorRampPalette(c(PALETTE[1], "white", PALETTE[5]))(200),
+                   diag = FALSE,
+                   title = sprintf("Spearman correlations: %d of 105 significant after BH correction",
+                                   n_sig_bh),
+                   mar = c(0, 0, 2, 0))
+```
+
+```{r corr-pairs}
+# Upper-triangle p-values from corr.test are BH-adjusted; lower triangle are raw.
+pairs <- which(upper.tri(cor_s$r), arr.ind = TRUE)
+pair_tab <- data.frame(
+  var1 = rownames(cor_s$r)[pairs[, 1]], var2 = colnames(cor_s$r)[pairs[, 2]],
+  spearman = cor_s$r[pairs], p_raw = t(cor_s$p)[pairs], p_bh = cor_s$p[pairs]
+) %>% arrange(p_raw)
+knitr::kable(round_df(head(pair_tab, 8), 4))
+cat("Pairs with raw p < 0.05:", sum(pair_tab$p_raw < .05), "of", nrow(pair_tab),
+    "| expected by chance:", round(0.05 * nrow(pair_tab), 1),
+    "| significant after BH:", sum(pair_tab$p_bh < .05), "\n")
+```
+
+```{r corr-one-pair}
+# Focus pair: supplier lead time vs. defect rate, with all three coefficients
+x <- sc$lead_time_supplier; y <- sc$defect_rates
+corrs <- data.frame(
+  method = c("pearson", "spearman", "kendall"),
+  estimate = sapply(c("pearson", "spearman", "kendall"), function(m) cor(x, y, method = m)),
+  p_value = sapply(c("pearson", "spearman", "kendall"),
+                   function(m) cor.test(x, y, method = m, exact = FALSE)$p.value)
+)
+pear <- cor.test(x, y)
+knitr::kable(round_df(corrs, 4), row.names = FALSE)
+pear$conf.int
+
+# Partial correlation: lead time vs. defects, controlling for manufacturing lead time
+pc <- psych::partial.r(sc[, c("lead_time_supplier", "defect_rates", "manufacturing_lead_time")],
+                       c(1, 2), 3)
+pc
+```
+
+```{r scatter, fig.height = 4.5}
+ggplot(sc, aes(lead_time_supplier, defect_rates)) +
+  geom_point(aes(colour = shipping_carriers), size = 2, alpha = .8) +
+  geom_smooth(method = "lm", colour = "black", fill = "grey80") +
+  geom_smooth(method = "loess", se = FALSE, colour = PALETTE[2], linetype = 2, span = .9) +
+  scale_colour_manual(values = PALETTE, name = "Carrier") +
+  labs(title = "Supplier lead time vs. defect rate",
+       subtitle = sprintf("Pearson r = %.2f [%.2f, %.2f]; black = OLS fit with 95%% CI, orange = LOESS",
+                          pear$estimate, pear$conf.int[1], pear$conf.int[2]),
+       x = "Supplier lead time (days)", y = "Defect rate (%)") +
+  theme_stats()
+```
+
+**Result.**
+
+* Out of `r nrow(pair_tab)` pairs, `r sum(pair_tab$p_raw < .05)` have raw p < 0.05, *fewer* than the `r round(0.05 * nrow(pair_tab), 1)` expected by pure chance, and `r sum(pair_tab$p_bh < .05)` survive the BH correction. Taken as a whole, the matrix is consistent with **no real correlations**, which fits the simulated-data hypothesis.
+* The strongest pair is **supplier lead time vs. defect rate** (Pearson r = `r round(pear$estimate, 2)`, 95% CI `r round(pear$conf.int[1], 2)` to `r round(pear$conf.int[2], 2)`, raw p = `r fmt_p(pear$p.value)`). On its own it looks convincing. But it was found by scanning all `r nrow(pair_tab)` pairs, so it is a **hypothesis generated by the data, not a confirmed effect**. This is a classic multiple-comparisons trap.
+* It is consistent across all three coefficients, and it barely changes when manufacturing lead time is held constant (partial r = `r round(pc[1, 2], 2)`).
+* The LOESS curve is close to the straight line, so a linear model is adequate.
+
+# 11. Regression
+
+## Simple linear regression
+
+Model: defect_rate = β₀ + β₁ · lead_time + ε, fitted by **ordinary least squares
+(OLS)**, which minimises Σ residual².
+
+* **β₁** is the expected change in the defect rate for one more day of lead time.
+* **R²** is the share of variance explained. For simple regression it equals r².
+* **Confidence interval vs. prediction interval.**
+  * The *confidence* interval covers the **average** defect rate at a given lead time.
+  * The *prediction* interval covers **a single new product**. It is always wider, because it also includes the residual noise σ².
+
+```{r slr}
+m1 <- lm(defect_rates ~ lead_time_supplier, data = sc)
+summary(m1)
+confint(m1)
+new <- data.frame(lead_time_supplier = c(5, 15, 30))
+cbind(new,
+      round(predict(m1, new, interval = "confidence"), 2),
+      round(predict(m1, new, interval = "prediction")[, -1], 2))
+```
+
+```{r slr-plot, fig.height = 4.5}
+grid <- data.frame(lead_time_supplier = seq(1, 30, length.out = 100))
+bands <- cbind(grid,
+               setNames(as.data.frame(predict(m1, grid, interval = "confidence")), c("fit", "cl", "cu")),
+               setNames(as.data.frame(predict(m1, grid, interval = "prediction"))[, 2:3], c("pl", "pu")))
+ggplot(bands, aes(lead_time_supplier)) +
+  geom_ribbon(aes(ymin = pl, ymax = pu), fill = PALETTE[1], alpha = .12) +
+  geom_ribbon(aes(ymin = cl, ymax = cu), fill = PALETTE[1], alpha = .35) +
+  geom_line(aes(y = fit), colour = PALETTE[1], linewidth = 1) +
+  geom_point(data = sc, aes(y = defect_rates), alpha = .6) +
+  labs(title = "Confidence band (dark) vs. prediction band (light)",
+       subtitle = sprintf("defect = %.2f + %.3f x lead time;  R-squared = %.3f",
+                          coef(m1)[1], coef(m1)[2], summary(m1)$r.squared),
+       x = "Supplier lead time (days)", y = "Defect rate (%)") +
+  theme_stats()
+```
+
+## Multiple linear regression and diagnostics
+
+We add manufacturing lead time, production volume, carrier and supplier to see
+whether the lead-time effect survives adjustment and whether the carrier effect
+from Section 8 holds.
+
+**What to report and check:**
+
+* **Overall fit.** Adjusted R² penalises extra predictors. The **F-test** asks whether the model beats an intercept-only model. **AIC and BIC** compare non-nested models, and lower is better.
+* **Standardised coefficients (β\*).** Effects in SD units, so predictors on different scales can be compared.
+* **Linearity and homoscedasticity.**
+  * *Residuals vs. fitted* plot: should show no pattern.
+  * *Breusch–Pagan test*: H0 is constant variance.
+  * *RESET test*: H0 is that the functional form is correct.
+* **Normality of residuals.** The Q-Q plot and Shapiro–Wilk test. This matters for the CIs and p-values in small samples.
+* **Independence.** *Durbin–Watson* test: a value near 2 means no autocorrelation. This matters for time-ordered data.
+* **Multicollinearity.** *VIF* (variance inflation factor). Above 5–10 the coefficients become unstable. For factors we use the generalised VIF, GVIF^(1/(2·df)), and compare it with √5 ≈ 2.2.
+* **Influential points.** *Cook's distance*: values above 4/n deserve a look. *Leverage* (hat values): products with unusual predictor values.
+* **Robust (HC3) standard errors.** They stay valid even if the variance is not constant.
+* **Nested model comparison.** A partial F-test asks whether the extra predictors add significant explanatory power.
+
+```{r mlr}
+m2 <- lm(defect_rates ~ lead_time_supplier + manufacturing_lead_time + production_volumes +
+           shipping_carriers + supplier_name, data = sc)
+summary(m2)
+```
+
+```{r mlr-diagnostics}
+library(lmtest)
+diag_tab <- data.frame(
+  diagnostic = c("Shapiro-Wilk (residual normality)", "Breusch-Pagan (homoscedasticity)",
+                 "RESET (functional form)", "Durbin-Watson (autocorrelation)"),
+  statistic = c(shapiro.test(residuals(m2))$statistic, bptest(m2)$statistic,
+                resettest(m2)$statistic, dwtest(m2)$statistic),
+  p_value = c(shapiro.test(residuals(m2))$p.value, bptest(m2)$p.value,
+              resettest(m2)$p.value, dwtest(m2)$p.value)
+)
+knitr::kable(round_df(diag_tab, 4), row.names = FALSE)
+car::vif(m2)
+```
+
+```{r mlr-robust}
+# Robust (heteroskedasticity-consistent, HC3) standard errors
+coeftest(m2, vcov = sandwich::vcovHC(m2, type = "HC3"))
+
+# Standardised coefficients
+effectsize::standardize_parameters(m2)
+
+# Nested model comparison: does the full model improve on lead time alone?
+anova(m1, m2)
+data.frame(model = c("m1: lead time", "m2: full"),
+           adj_R2 = c(summary(m1)$adj.r.squared, summary(m2)$adj.r.squared),
+           AIC = c(AIC(m1), AIC(m2)), BIC = c(BIC(m1), BIC(m2))) %>% knitr::kable(digits = 3)
+```
+
+```{r mlr-diag-plots, fig.height = 7}
+diag_df <- data.frame(fitted = fitted(m2), resid = residuals(m2),
+                      std_resid = rstandard(m2), cooks = cooks.distance(m2),
+                      leverage = hatvalues(m2), id = seq_len(nrow(sc)))
+cook_cut <- 4 / nrow(sc)
+d1p <- ggplot(diag_df, aes(fitted, resid)) + geom_point(alpha = .6) +
+  geom_hline(yintercept = 0, linetype = 2) + geom_smooth(se = FALSE, colour = PALETTE[2]) +
+  labs(title = "Residuals vs fitted", x = "Fitted", y = "Residual") + theme_stats()
+d2p <- ggplot(diag_df, aes(sample = std_resid)) + stat_qq(alpha = .6) +
+  stat_qq_line(colour = PALETTE[2]) +
+  labs(title = "Normal Q-Q of residuals", x = "Theoretical", y = "Standardised residual") + theme_stats()
+d3p <- ggplot(diag_df, aes(fitted, sqrt(abs(std_resid)))) + geom_point(alpha = .6) +
+  geom_smooth(se = FALSE, colour = PALETTE[2]) +
+  labs(title = "Scale-location", x = "Fitted", y = "sqrt(|std. residual|)") + theme_stats()
+d4p <- ggplot(diag_df, aes(leverage, std_resid, size = cooks)) +
+  geom_point(alpha = .5, colour = ifelse(diag_df$cooks > cook_cut, PALETTE[5], "grey30")) +
+  scale_size_continuous(range = c(1, 5), guide = "none") +
+  labs(title = "Residuals vs leverage", subtitle = "Size = Cook's distance; red > 4/n",
+       x = "Leverage (hat value)", y = "Standardised residual") + theme_stats()
+(d1p + d2p) / (d3p + d4p)
+```
+
+**Result.**
+
+* The full model explains `r percent(summary(m2)$r.squared, 1)` of the variance in defect rates (adjusted R² = `r round(summary(m2)$adj.r.squared, 3)`, F-test p = `r fmt_p(pf(summary(m2)$fstatistic[1], summary(m2)$fstatistic[2], summary(m2)$fstatistic[3], lower.tail = FALSE))`).
+* **Supplier lead time remains significant** after adjustment: each extra day adds about `r round(coef(m2)["lead_time_supplier"], 3)` pp. **Carrier B** stays about `r round(-coef(m2)["shipping_carriersCarrier B"], 2)` pp lower than Carrier A.
+* Supplier identity does not predict *defect rates*, even though it predicts *inspection failures* (Section 9).
+* Every diagnostic is acceptable:
+  * residuals are normal and homoscedastic;
+  * no misspecification (RESET);
+  * no multicollinearity (all GVIF < 2.2);
+  * no observation is overly influential (`r sum(cooks.distance(m2) > 4 / nrow(sc))` points exceed 4/n, but the largest Cook's distance is `r round(max(cooks.distance(m2)), 2)`, far below 1);
+  * the robust HC3 standard errors give the same conclusions.
+* The partial F-test p is `r fmt_p(anova(m1, m2)$"Pr(>F)"[2])`, so the extra predictors do not add significant explanatory power as a block. Both AIC and BIC prefer the simple model, even though Carrier B is individually significant: a reminder to judge models and single coefficients separately.
+
+## Logistic regression
+
+**Question:** what predicts a **failed** inspection (binary outcome)?
+
+* Model: log(p / (1 − p)) = β₀ + β₁x₁ + …, fitted by maximum likelihood.
+* exp(β) is the **odds ratio**: the multiplicative change in the odds of failing for a one-unit increase in x.
+* Overall fit:
+  * the **likelihood-ratio test** against the null model;
+  * **McFadden pseudo-R²** = 1 − LL_model / LL_null (values of 0.2–0.4 indicate a good fit);
+  * **Tjur's R²**: the difference in mean predicted probability between the two outcome groups.
+* Classification quality:
+  * the confusion matrix, accuracy, sensitivity and specificity at a 0.5 cut-off;
+  * **ROC-AUC**: the probability that a random failed product gets a higher score than a random non-failed one.
+
+```{r logistic}
+sc$failed <- as.integer(sc$inspection_results == "Fail")
+lg <- glm(failed ~ defect_rates + manufacturing_lead_time + supplier_name,
+          family = binomial, data = sc)
+summary(lg)
+
+or_tab <- data.frame(odds_ratio = exp(coef(lg)), exp(confint.default(lg)),
+                     p_value = summary(lg)$coefficients[, 4])
+names(or_tab)[2:3] <- c("ci_low", "ci_high")
+knitr::kable(round_df(or_tab, 3))
+
+lg0 <- glm(failed ~ 1, family = binomial, data = sc)
+lrt <- anova(lg0, lg, test = "LRT")
+lrt
+mcfadden <- 1 - as.numeric(logLik(lg)) / as.numeric(logLik(lg0))
+tjur <- performance::r2_tjur(lg)
+
+p_hat <- fitted(lg)
+pred <- as.integer(p_hat > 0.5)
+cm <- table(predicted = pred, actual = sc$failed)
+cm
+auc <- mean(outer(p_hat[sc$failed == 1], p_hat[sc$failed == 0], ">") +
+            0.5 * outer(p_hat[sc$failed == 1], p_hat[sc$failed == 0], "=="))
+class_tab <- data.frame(
+  metric = c("McFadden R²", "Tjur R²", "Accuracy", "Sensitivity (recall of Fail)",
+             "Specificity", "ROC-AUC", "Base rate (always 'not fail')"),
+  value = c(mcfadden, tjur, mean(pred == sc$failed), cm["1", "1"] / sum(cm[, "1"]),
+            cm["0", "0"] / sum(cm[, "0"]), auc, 1 - mean(sc$failed))
+)
+knitr::kable(round_df(class_tab, 3))
+```
+
+```{r logistic-plot, fig.height = 4.5}
+or_plot <- or_tab[-1, ] %>% mutate(term = rownames(.))
+p_or <- ggplot(or_plot, aes(odds_ratio, reorder(term, odds_ratio))) +
+  geom_vline(xintercept = 1, linetype = 2) +
+  geom_pointrange(aes(xmin = ci_low, xmax = ci_high, colour = p_value < .05)) +
+  scale_x_log10() +
+  scale_colour_manual(values = c(`TRUE` = PALETTE[5], `FALSE` = "grey50"),
+                      labels = c(`TRUE` = "p < 0.05", `FALSE` = "n.s."), name = NULL) +
+  labs(title = "Odds ratios for failing inspection", subtitle = "95% Wald CI, log scale",
+       x = "Odds ratio", y = NULL) + theme_stats()
+
+roc <- do.call(rbind, lapply(sort(unique(c(0, p_hat, 1))), function(t)
+  data.frame(fpr = mean(p_hat[sc$failed == 0] >= t), tpr = mean(p_hat[sc$failed == 1] >= t))))
+p_roc <- ggplot(roc, aes(fpr, tpr)) + geom_abline(linetype = 2, colour = "grey50") +
+  geom_step(colour = PALETTE[1], linewidth = 1, direction = "vh") +
+  labs(title = sprintf("ROC curve (AUC = %.2f)", auc), x = "False positive rate",
+       y = "True positive rate") + coord_equal() + theme_stats()
+p_or + p_roc + plot_layout(widths = c(1.4, 1))
+```
+
+**Result.**
+
+* The model is significantly better than the null model (LR test p = `r fmt_p(lrt$"Pr(>Chi)"[2])`, McFadden R² = `r round(mcfadden, 2)`, AUC = `r round(auc, 2)`). The AUC is in-sample, so it is optimistic.
+* Holding the other variables constant:
+  * **Supplier 4** multiplies the odds of failing by about `r round(or_tab["supplier_nameSupplier 4", "odds_ratio"], 1)` compared with Supplier 1. The CI is very wide (`r round(or_tab["supplier_nameSupplier 4", "ci_low"], 1)` to `r round(or_tab["supplier_nameSupplier 4", "ci_high"], 1)`) because there are only 18 Supplier 4 products, but it clearly excludes 1.
+  * Each extra day of **manufacturing lead time** lowers the odds by about `r percent(1 - or_tab["manufacturing_lead_time", "odds_ratio"], 1)`.
+  * Higher **defect rates** raise them, but only at the 10% level.
+* The negative effect of lead time is counter-intuitive. One possibility is that rushed production fails more often, but with n = 100 this should be confirmed on new data before anyone acts on it.
+
+# 12. Statistical power and sample size
+
+* **Power** = P(reject H0 | H0 is false) = 1 − β. It depends on the effect size, the sample size, α, and the test.
+* An *a priori* analysis finds the sample size needed for 80% power. A *sensitivity* analysis finds the smallest effect detectable with the sample we have.
+* Low power has two consequences. Non-significant results are inconclusive. And the significant results that do appear tend to *overestimate* the true effect (the "winner's curse").
+
+```{r power}
+library(pwr)
+pw <- data.frame(
+  question = c(
+    "Power of the one-sample t-test for the observed d (Section 6)",
+    "Power of the Fail vs Pass comparison for the observed g (Section 7)",
+    "n per group needed to detect that g with 80% power",
+    "Total n needed to detect a correlation of r = 0.20 with 80% power",
+    "Smallest correlation detectable with n = 100 at 80% power",
+    "Smallest ANOVA effect f detectable (3 groups of ~33) at 80% power"),
+  value = c(
+    pwr.t.test(n = 100, d = d1$Cohens_d, type = "one.sample")$power,
+    pwr.t2n.test(n1 = 36, n2 = 23, d = g2$Hedges_g)$power,
+    ceiling(pwr.t.test(d = g2$Hedges_g, power = .8)$n),
+    ceiling(pwr.r.test(r = .2, power = .8)$n),
+    pwr.r.test(n = 100, power = .8)$r,
+    pwr.anova.test(k = 3, n = 33, power = .8)$f)
+)
+knitr::kable(round_df(pw, 3))
+```
+
+```{r power-curve, fig.height = 4}
+curve_df <- expand.grid(n = seq(10, 300, 5), d = c(.2, .35, .5, .8))
+curve_df$power <- mapply(function(n, d) pwr.t.test(n = n, d = d)$power, curve_df$n, curve_df$d)
+ggplot(curve_df, aes(n, power, colour = factor(d))) +
+  geom_line(linewidth = 1) + geom_hline(yintercept = .8, linetype = 2) +
+  scale_colour_manual(values = PALETTE, name = "Cohen's d") +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Power of a two-sample t-test (alpha = 0.05)",
+       subtitle = "Dashed line = conventional 80% target", x = "n per group", y = "Power") +
+  theme_stats()
+```
+
+**Result.**
+
+* The Fail vs Pass comparison had only about `r percent(pw$value[2], 1)` power. Its non-significant p-value is therefore *inconclusive*, not evidence of "no difference". Detecting an effect of that size reliably would need about `r pw$value[3]` products per group.
+* With 100 SKUs, only correlations of |r| ≥ `r round(pw$value[5], 2)` are reliably detectable.
+
+# 13. Multiple testing
+
+Every test at α = 0.05 has a 5% false-positive rate. With m tests, the chance of at
+least one false positive is 1 − 0.95^m. For the 12 tests below that is
+`r percent(1 - 0.95^12, 1)`.
+
+* **Bonferroni**: multiply each p by m. It controls the family-wise error rate (FWER) but is very conservative.
+* **Holm**: a step-down version of Bonferroni. It is uniformly more powerful and still controls the FWER.
+* **Benjamini–Hochberg (BH)**: controls the false discovery rate (FDR), the expected share of false positives among the rejections. It is the standard choice for exploratory analysis.
+
+```{r multiple-testing}
+mt <- data.frame(
+  test = c("Product types equally frequent (GoF)", "Fail rate = 30% (binomial)",
+           "Mean defect rate = 2% (t)", "Fail vs Pass defect rate (Welch)",
+           "Defect rate by carrier (ANOVA)", "Defect rate by carrier (Kruskal-Wallis)",
+           "Cost: product type (2-way)", "Cost: transport mode (2-way)",
+           "Cost: interaction (2-way)", "Supplier x inspection (Fisher)",
+           "Lead time vs defect rate (Pearson)", "Logistic model vs null (LRT)"),
+  p_raw = c(gof$p.value, binom$p.value, t1$p.value, t_welch$p.value,
+            summary(aov1)[[1]]$`Pr(>F)`[1], kw_1$p.value,
+            car::Anova(aov2, type = 2)$`Pr(>F)`[1:3], fisher$p.value, pear$p.value,
+            lrt$`Pr(>Chi)`[2])
+)
+mt$bonferroni <- p.adjust(mt$p_raw, "bonferroni")
+mt$holm <- p.adjust(mt$p_raw, "holm")
+mt$bh <- p.adjust(mt$p_raw, "BH")
+mt$significant_bh <- mt$bh < .05
+knitr::kable(round_df(mt[order(mt$p_raw), ], 4), row.names = FALSE)
+```
+
+**Result.** After the BH correction, `r sum(mt$significant_bh)` of 12 findings
+remain significant: `r paste(mt$test[mt$significant_bh], collapse = "; ")`.
+
+The stricter Holm correction keeps only `r sum(mt$holm < .05)`:
+`r paste(mt$test[mt$holm < .05], collapse = "; ")`. The supplier and carrier
+effects sit right at the boundary. They are solid enough to investigate, but not
+strong enough to act on without confirmation.
+
+One caveat: the lead time vs. defect rate pair was *chosen* after looking at the
+correlation matrix (Section 10). Within this 12-test family it looks
+significant, but the honest correction is the one over all 105 pairs, where it
+does not survive.
+
+# 14. Summary of findings
+
+```{r summary-table, echo = FALSE}
+summary_tab <- data.frame(
+  Question = c("What do the distributions look like?",
+               "Is revenue concentrated in a few SKUs?",
+               "Is the defect rate above the 2% target?",
+               "Do failed products have higher defect rates?",
+               "Does the carrier matter for defect rates?",
+               "Do logistics costs depend on product or transport mode?",
+               "Does inspection outcome depend on the supplier?",
+               "Does lead time relate to defect rates?",
+               "What predicts inspection failure?"),
+  Answer = c(
+    "Symmetric and uniform-like (excess kurtosis -1.1 to -1.4, no outliers): most likely simulated data.",
+    sprintf("No. Gini = %.2f; the top 20%% of SKUs earn %s of revenue.", g_rev, percent(top20_share, 1)),
+    sprintf("Probably slightly (mean %.2f%%), but not significant (p = %s; power only %s).",
+            t1$estimate, fmt_p(t1$p.value), percent(pw$value[1], 1)),
+    sprintf("Medium effect (g = %.2f) but p = %s; underpowered, so inconclusive.",
+            g2$Hedges_g, fmt_p(t_welch$p.value)),
+    sprintf("Carrier B is lower than A and C (omega^2 = %.2f, p = %s; survives BH, not Holm).",
+            eff_anova$estimate[2], fmt_p(summary(aov1)[[1]]$`Pr(>F)`[1])),
+    "No significant main effects or interaction.",
+    sprintf("Yes, moderate association: Fisher p = %s, Cramer's V = %.2f. Supplier 4 fails %s of the time.",
+            fmt_p(fisher$p.value), cv$Cramers_v, percent(prop2$estimate[1], 1)),
+    sprintf("Possibly (r = %.2f, raw p = %s), but it does not survive correction across all 105 pairs: a hypothesis to test.",
+            pear$estimate, fmt_p(pear$p.value)),
+    sprintf("Supplier 4 (OR about %.0f) and shorter manufacturing lead time.",
+            or_tab["supplier_nameSupplier 4", "odds_ratio"]))
+)
+knitr::kable(summary_tab)
+```
+
+**Recommended actions:**
+
+1. Audit **Supplier 4**. It is the largest and most consistent effect: it appears in the contingency table, the two-proportion test, and the logistic regression.
+2. Review Carrier B's handling process. It is associated with lower defect rates in both the ANOVA and the regression.
+3. Treat the lead time and "rushed production" effects as hypotheses. Collect more data before acting on them; the power analysis shows how many observations are needed.
+
+```{r session-info}
+sessionInfo()
+```
